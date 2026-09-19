@@ -250,6 +250,29 @@ CALLME_PUBLIC_URL=https://your-url.com bun run dev:sse
 
 ---
 
+## Automatic release branch preparation
+
+The standard release command can start on a clean named feature branch. It fetches
+`origin/main`, switches to `main` (creating the local tracking branch if needed),
+and pulls with fast-forward-only behavior before calculating a version or creating
+release metadata. If the branch or commit changes, it restarts the release script
+from the updated checkout with the same arguments. It leaves the checkout on `main`.
+
+Unmerged feature commits remain on their original branch and are not included in
+the release. Merge the relevant pull request first if those changes must ship.
+Local-only or divergent `main` commits, detached HEAD, unavailable Git access,
+and `main` already open in another worktree stop preparation safely. Commit or
+stash pending changes before switching or pulling; the command never resets,
+rebases, automatically stashes, or merges feature work.
+
+Run the branch-preparation regression checks without publishing anything:
+
+```bash
+node --test scripts/ci/release-branch.test.cjs
+```
+
+This command does not offer a dry-run mode. Use the tests above to check preparation safely.
+
 ## License
 
 MIT

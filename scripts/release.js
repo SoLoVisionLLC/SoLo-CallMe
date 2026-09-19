@@ -13,6 +13,7 @@ import { readFileSync, writeFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { startReleaseOnMain } from './lib/release-branch.cjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = join(__dirname, '..');
@@ -60,6 +61,8 @@ function main() {
     console.error('Usage: node scripts/release.js [patch|minor|major]');
     process.exit(1);
   }
+
+  startReleaseOnMain(rootDir, 'scripts/release.js');
 
   // Check for uncommitted changes
   try {

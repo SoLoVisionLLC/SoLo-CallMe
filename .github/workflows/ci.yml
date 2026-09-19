@@ -13,6 +13,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Node for release regression tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Release branch safety checks
+        run: node --test scripts/ci/release-branch.test.cjs
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
