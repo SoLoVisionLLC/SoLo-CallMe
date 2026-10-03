@@ -1,0 +1,74 @@
+// Default checkout preserves the workflow's GitHub PR merge semantics.
+// Only the explicitly opted-in Social native workflow uses the PR head ref.
+// No application credentials are bound by this validation pipeline.
+def exactCheckout(boolean pullRequestHead = false) {
+  def requested = params.SOURCE_COMMIT?.trim() ?: env.CI_SOURCE_COMMIT?.trim()
+  if (requested && !(requested ==~ /^[a-f0-9]{40}$/)) error('SOURCE_CONFIG: invalid SOURCE_COMMIT')
+  def refs = '+refs/heads/*:refs/remotes/origin/*'
+  def prKind = pullRequestHead ? 'head' : 'merge'
+  def source = requested ? 'refs/remotes/origin/ci-source' : (env.CHANGE_ID ? "refs/remotes/origin/pr/${env.CHANGE_ID}/${prKind}" : scm.branches[0].name)
+  if (requested) refs += " +${requested}:refs/remotes/origin/ci-source"
+  if (env.CHANGE_ID) {
+    if (!(env.CHANGE_ID ==~ /^[0-9]+$/)) error('SOURCE_CONFIG: invalid PR number')
+    refs += " +refs/pull/${env.CHANGE_ID}/head:refs/remotes/origin/pr/${env.CHANGE_ID}/head"
+    if (!pullRequestHead) refs += " +refs/pull/${env.CHANGE_ID}/merge:refs/remotes/origin/pr/${env.CHANGE_ID}/merge"
+  }
+  deleteDir()
+  def result = checkout([$class: 'GitSCM', branches: [[name: source]],
+    userRemoteConfigs: scm.userRemoteConfigs.collect { r ->
+      [url: r.url, credentialsId: r.credentialsId, refspec: refs]
+    }, extensions: [[$class: 'CloneOption', shallow: false, noTags: false, honorRefspec: true]]])
+  def actual = result.GIT_COMMIT
+  if (!(actual ==~ /^[a-f0-9]{40}$/) || (requested && actual != requested)) error('SOURCE_CONFIG: checkout SHA mismatch')
+  if (env.CHANGE_ID) {
+    def expectedRef = "refs/remotes/origin/pr/${env.CHANGE_ID}/${prKind}"
+    def head = isUnix() ? sh(script: "git rev-parse ${expectedRef}", returnStdout: true).trim() : powershell(script: "git rev-parse ${expectedRef}", returnStdout: true).trim()
+    if (actual != head) error(pullRequestHead ? 'SOURCE_CONFIG: checkout is not current PR head' : 'SOURCE_CONFIG: checkout is not current PR merge')
+  }
+  env.GIT_COMMIT = actual
+  env.CI_SOURCE_COMMIT = actual
+  echo "Validated exact source ${actual}"
+}
+pipeline {
+  agent none
+  options {
+    skipDefaultCheckout(true)
+
+    timestamps()
+    buildDiscarder(logRotator(daysToKeepStr: '30', artifactDaysToKeepStr: '14'))
+
+  }
+  parameters {
+    string(name: 'SOURCE_COMMIT', defaultValue: '', description: 'Optional exact source SHA. Social native PR jobs require the current head; other PR jobs default to the GitHub merge ref.')
+    booleanParam(name: 'MANUAL_RUN', defaultValue: false, description: 'Explicit manual workflow dispatch; enabled only by pipelines with a manual trigger.')
+
+  }
+
+  stages {
+    stage('Workflow event scope') {
+      steps {
+        script { if (!(env.BRANCH_NAME == 'main' || (env.CHANGE_ID && env.CHANGE_TARGET == 'main'))) error('SOURCE_CONFIG: event is outside the original workflow trigger scope') }
+      }
+    }
+    stage('Server CI') {
+      agent { label 'linux-native' }
+      steps {
+        timeout(time: 360, unit: 'MINUTES') {
+          script { exactCheckout() }
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
+node -e "if(process.versions.node.split('.')[0] !== '22') throw Error('TOOLCHAIN: Node 22 required')"
+node --test scripts/ci/release-branch.test.cjs
+bun --version
+cd server
+bun install
+# Preserve existing advisory failure semantics; these are not required gates.
+bun run tsc --noEmit || true
+bun run -e "import './src/index.ts'" 2>&1 | head -5 || true
+'''
+        }
+      }
+    }
+
+  }
+}

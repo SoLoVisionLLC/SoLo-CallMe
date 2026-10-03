@@ -1,0 +1,22 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { createPlan, imageTags, ociLabels, releaseBody, verifySource } from './release-plan.mjs';
+
+const sha = 'a'.repeat(40);
+test('stable semantic tags and latest match metadata-action',()=>assert.deepEqual(imageTags('v1.2.3'),['1.2.3','1.2','latest']));
+test('prerelease does not overwrite major.minor but raw latest remains',()=>assert.deepEqual(imageTags('v2.0.0-rc.1'),['2.0.0-rc.1','latest']));
+test('build metadata does not enter version tag',()=>assert.deepEqual(imageTags('v1.2.3+build.9'),['1.2.3','1.2','latest']));
+test('non-semver and invalid numeric prerelease retain latest-only',()=>{assert.deepEqual(imageTags('vnext'),['latest']);assert.deepEqual(imageTags('v1.2.3-01'),['latest']);});
+test('zero-major releases keep zero-major.minor output',()=>assert.deepEqual(imageTags('v0.8.2'),['0.8.2','0.8','latest']));
+test('validation cannot publish',()=>assert.throws(()=>createPlan({tag:'v1.2.3',sha,event:'validation',publish:true}),/cannot publish/));
+test('push is restricted to original v glob',()=>assert.throws(()=>createPlan({tag:'1.2.3',sha,event:'push'}),/v\*/));
+test('published release accepts non-v tag',()=>assert.equal(createPlan({tag:'1.2.3',sha,event:'release_published'}).event,'release_published'));
+test('bad commit and shell-control tag fail',()=>{assert.throws(()=>createPlan({tag:'v1.2.3',sha:'main',event:'push'}),/exact commit/);assert.throws(()=>createPlan({tag:'v1.2.3\nother',sha,event:'push'}),/invalid source tag/);});
+test('release body preserves install and hosted configuration',()=>{const body=releaseBody('v1.2.3');assert.ok(body.startsWith('## solo-callme 1.2.3\n'));assert.ok(body.includes('cd SoLo-CallMe/server && bun install && bun run src/index.ts'));assert.ok(body.includes('claude mcp add -s user --transport http solo-callme https://callme.sololink.cloud/mcp'));assert.ok(body.endsWith('for details.\n'));});
+test('OCI labels preserve all original metadata fields',()=>{const plan=createPlan({tag:'v1.2.3',sha,event:'push'});const labels=ociLabels(plan,{name:'SoLo-CallMe',description:'description=a',html_url:'https://github.com/SoLoVisionLLC/SoLo-CallMe',license:{spdx_id:'MIT'}},'2026-01-01T00:00:00.000Z');assert.equal(Object.keys(labels).length,8);assert.equal(labels['org.opencontainers.image.revision'],sha);assert.equal(labels['org.opencontainers.image.version'],'1.2.3');assert.equal(labels['org.opencontainers.image.description'],'description=a');});
+test('missing lockfile blocks source readiness',()=>{const root=mkdtempSync(join(tmpdir(),'callme-release-'));const write=(path,data)=>{mkdirSync(dirname(join(root,path)),{recursive:true});writeFileSync(join(root,path),data);};try{write('Dockerfile','RUN bun install --frozen-lockfile --production');write('package.json','{"version":"1.0.0"}');write('server/package.json','{"version":"1.0.0"}');write('server/src/index-sse.ts','');assert.throws(()=>verifySource(root),/Bun lockfile/);write('server/bun.lock','{}');assert.doesNotThrow(()=>verifySource(root));write('server/package.json','{"version":"2.0.0"}');assert.throws(()=>verifySource(root),/version mismatch/);}finally{rmSync(root,{recursive:true});}});
+test('trusted pipeline preserves gate order and opt-in publication',()=>{const source=readFileSync(new URL('../../Jenkinsfile.release',import.meta.url),'utf8');assert.match(source,/booleanParam\(name: 'PUBLISH', defaultValue: false/);const gate=source.indexOf("stage('Release Readiness Gate')");assert.ok(gate>0);assert.ok(gate<source.indexOf("stage('GitHub release')"));assert.ok(gate<source.indexOf("stage('Build container')"));assert.doesNotMatch(source,/changeset|disableConcurrentBuilds|githubPush/);assert.match(source,/timeout\(time: 2, unit: 'MINUTES'\)/);});
+test('publisher isolates credentials from subprocess environment and context',()=>{const source=readFileSync(new URL('./release-publisher.mjs',import.meta.url),'utf8');assert.match(source,/delete safeEnv.GH_TOKEN/);assert.match(source,/delete safeEnv.GHCR_PASSWORD/);assert.match(source,/const source = resolve\('source'\)/);assert.match(source,/if \(plan.publish\) args.push\('--push'\)/);assert.match(source,/if \(!plan.publish/);});

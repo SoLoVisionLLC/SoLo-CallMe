@@ -1,0 +1,112 @@
+// Dedicated trusted SCM job. Event adapter activation is documented separately.
+// Root checkout is reviewed pipeline tooling; tagged Docker source stays in source/.
+pipeline {
+  agent { label 'linux-native' }
+  options { skipDefaultCheckout(true); timestamps() }
+  parameters {
+    booleanParam(name: 'PUBLISH', defaultValue: false, description: 'Separate authorization required for GitHub release writes and GHCR publication.')
+    choice(name: 'SOURCE_EVENT', choices: ['validation', 'push', 'release_published'], description: 'Authenticated adapter maps v* tag pushes or published release events.')
+    string(name: 'RELEASE_TAG', defaultValue: '', description: 'Existing tag, never created by Jenkins.')
+    string(name: 'SOURCE_COMMIT', defaultValue: '', description: 'Exact 40-character commit of the event tag.')
+  }
+  environment { RELEASE_SOURCE_DIR = 'source' }
+  stages {
+    stage('Resolve release source') {
+      steps {
+        script {
+          if (!(params.SOURCE_COMMIT ==~ /^[a-f0-9]{40}$/)) error('SOURCE_CONFIG: exact SOURCE_COMMIT required')
+          if (!params.RELEASE_TAG?.trim()) error('SOURCE_CONFIG: RELEASE_TAG required')
+          if (params.PUBLISH && params.SOURCE_EVENT == 'validation') error('SOURCE_CONFIG: validation cannot publish')
+          deleteDir()
+          // Job configuration must pin this tooling checkout to a reviewed trusted ref.
+          checkout scm
+          sh '''#!/bin/bash
+set -euo pipefail
+node -e "if (process.versions.node.split('.')[0] !== '22') throw Error('TOOLCHAIN: Node 22 required')"
+git check-ref-format "refs/tags/$RELEASE_TAG"
+node --test scripts/ci/release-plan.test.mjs scripts/ci/release-cleanup.test.mjs
+node scripts/ci/release-plan.mjs
+'''
+          dir('source') {
+            def result = checkout([$class: 'GitSCM', branches: [[name: params.SOURCE_COMMIT]],
+              userRemoteConfigs: scm.userRemoteConfigs.collect { remote ->
+                [url: remote.url, credentialsId: remote.credentialsId, refspec: '+refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*']
+              }, extensions: [[$class: 'CloneOption', shallow: false, noTags: false, honorRefspec: true]]])
+            if (result.GIT_COMMIT != params.SOURCE_COMMIT) error('SOURCE_CONFIG: commit checkout mismatch')
+            sh '''#!/bin/bash
+set -euo pipefail
+test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$SOURCE_COMMIT"
+'''
+          }
+        }
+      }
+    }
+    stage('Release Readiness Gate') {
+      steps {
+        timeout(time: 2, unit: 'MINUTES') {
+          sh 'npm run release:readiness:jenkins'
+        }
+      }
+    }
+    stage('Resolve OCI metadata') {
+      when { expression { params.PUBLISH } }
+      steps {
+        withCredentials([string(credentialsId: env.CALLME_GITHUB_CREDENTIAL_ID, variable: 'GH_TOKEN')]) {
+          sh '''#!/bin/bash
+set -euo pipefail
+set +x
+node scripts/ci/release-publisher.mjs metadata
+'''
+        }
+      }
+    }
+    stage('GitHub release') {
+      when { expression { params.PUBLISH && params.SOURCE_EVENT == 'push' } }
+      steps {
+        withCredentials([string(credentialsId: env.CALLME_GITHUB_CREDENTIAL_ID, variable: 'GH_TOKEN')]) {
+          sh '''#!/bin/bash
+set -euo pipefail
+set +x
+node scripts/ci/release-publisher.mjs github
+'''
+        }
+      }
+    }
+    stage('Build container') {
+      steps {
+        timeout(time: 360, unit: 'MINUTES') {
+          script {
+            // A failed GitHub release stage stops this stage, matching needs: release.
+            if (params.PUBLISH) {
+              withCredentials([usernamePassword(credentialsId: env.CALLME_GHCR_CREDENTIAL_ID, usernameVariable: 'GHCR_USERNAME', passwordVariable: 'GHCR_PASSWORD')]) {
+                sh '''#!/bin/bash
+set -euo pipefail
+set +x
+node scripts/ci/release-publisher.mjs container
+'''
+              }
+            } else {
+              sh 'node scripts/ci/release-publisher.mjs container'
+            }
+          }
+        }
+      }
+    }
+  }
+  post {
+    always {
+      script {
+        try {
+          if (fileExists('scripts/ci/release-cleanup.mjs')) {
+            timeout(time: 2, unit: 'MINUTES') {
+              sh 'node scripts/ci/release-cleanup.mjs'
+            }
+          }
+        } finally {
+          // Remove the private registry config even if daemon cleanup failed.
+          deleteDir()
+        }
+      }
+    }
+  }
+}

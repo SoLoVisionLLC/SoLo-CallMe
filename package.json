@@ -12,7 +12,8 @@
     "release:patch": "node scripts/release.js patch",
     "release:minor": "node scripts/release.js minor",
     "release:major": "node scripts/release.js major",
-    "install:server": "cd server && bun install"
+    "install:server": "cd server && bun install",
+    "release:readiness:jenkins": "node scripts/ci/release-readiness-gate.mjs"
   },
   "repository": {
     "type": "git",
