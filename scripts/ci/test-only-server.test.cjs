@@ -5,6 +5,9 @@ const {tmpdir} = require('node:os');
 const {join} = require('node:path');
 const {spawnSync} = require('node:child_process');
 const source = readFileSync(join(__dirname, 'test-only-server.sh'), 'utf8');
+test('POSIX runner is stored with LF line endings', () => {
+  assert.ok(!source.includes('\r'), 'Shell source must not contain carriage returns');
+});
 for (const scenario of ['success', 'install-noop', 'install-fail', 'build-noop', 'build-fail']) {
   test(`actual shell runner: ${scenario}`, () => {
     const root = mkdtempSync(join(tmpdir(), 'callme-ci-runner-'));
@@ -30,10 +33,14 @@ bun() {
 }
 . ./runner.sh
 `;
-      const bash = process.platform === 'win32' ? 'C:/Program Files/Git/bin/bash.exe' : 'bash';
-      const result = spawnSync(bash, ['-c',fixture], {cwd:root, env:{...process.env,SCENARIO:scenario},encoding:'utf8',timeout:10000});
+      const shell = process.platform === 'win32' ? 'C:/Program Files/Git/usr/bin/dash.exe' : '/bin/sh';
+      const shellEnv = {...process.env,SCENARIO:scenario};
+      if (process.platform === 'win32') shellEnv.PATH = '/usr/bin:/bin';
+      const result = spawnSync(shell, ['-c',fixture], {cwd:root, env:shellEnv,encoding:'utf8',timeout:10000});
       assert.ifError(result.error);
       assert.equal(result.status === 0, scenario === 'success', result.stdout + result.stderr);
+      if (scenario === 'install-fail') assert.equal(result.status, 72);
+      if (scenario === 'build-fail') assert.equal(result.status, 73);
       if (scenario === 'install-noop') assert.match(result.stderr, /SDK installation missing/);
       if (scenario === 'build-noop') assert.match(result.stderr, /nonempty index.js missing/);
       if (scenario === 'success') assert.match(result.stdout, /ADVISORY/);
