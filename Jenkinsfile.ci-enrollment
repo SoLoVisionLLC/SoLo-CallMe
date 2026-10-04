@@ -1,0 +1,63 @@
+// Dedicated manual TEST-ONLY job. Existing CI and release pipelines are unchanged.
+pipeline {
+  agent { label 'linux-native' }
+  options { skipDefaultCheckout(true); timestamps(); buildDiscarder(logRotator(daysToKeepStr: '30')) }
+  parameters {
+    booleanParam(name: 'TEST_ONLY', defaultValue: false, description: 'Explicitly authorize this validation-only run.')
+    string(name: 'EXPECTED_SHA', defaultValue: '', description: 'Full immutable commit; configure exactly this one SCM branch spec too.')
+  }
+  stages {
+    stage('Test-only validation') {
+      steps {
+        timeout(time: 360, unit: 'MINUTES') {
+          script {
+            def expected = params.EXPECTED_SHA?.trim()
+            if (params.TEST_ONLY != true) error('SOURCE_CONFIG: TEST_ONLY must be explicitly true')
+            if (!(expected ==~ /^[a-f0-9]{40}$/) || scm.branches?.size() != 1 || scm.branches[0].name != expected) {
+              error('SOURCE_CONFIG: exactly one literal SCM SHA must equal EXPECTED_SHA')
+            }
+            deleteDir()
+            try {
+              def revision = checkout([$class: 'GitSCM', branches: [[name: 'refs/remotes/origin/ci-expected']],
+                userRemoteConfigs: scm.userRemoteConfigs.collect { r -> [url: r.url, credentialsId: r.credentialsId, refspec: "+${expected}:refs/remotes/origin/ci-expected"] },
+                extensions: [[$class: 'CloneOption', shallow: false, noTags: true, honorRefspec: true]]])
+              def actual = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+              if (revision.GIT_COMMIT != expected || actual != expected) error('SOURCE_CONFIG: checkout metadata or actual HEAD mismatch')
+              def owner = sh(script: 'test "$(id -u)" != 0; printf "%s:%s" "$(id -u)" "$(id -g)"', returnStdout: true).trim()
+              if (!(owner ==~ /^[1-9][0-9]*:[0-9]+$/)) error('TOOLCHAIN: non-root Linux owner required')
+              docker.image('node:22-bookworm').inside("--user ${owner}") {
+              timeout(time: 1, unit: 'MINUTES') {
+                def nodeSha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                if (nodeSha != expected) error('SOURCE_CONFIG: Node container HEAD mismatch')
+                sh '''#!/bin/sh
+set -eu
+env -i PATH="$PATH" node -e 'if(process.versions.node.split(".")[0] !== "22") throw Error("TOOLCHAIN: Node 22 required")'
+'''
+              }
+              sh '''#!/bin/sh
+set -eu
+env -i PATH="$PATH" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 node --test scripts/ci/release-branch.test.cjs scripts/ci/release-plan.test.mjs scripts/ci/release-cleanup.test.mjs scripts/ci/test-only-server.test.cjs
+'''
+              }
+              docker.image('oven/bun:1.3.3-debian').inside("--user ${owner}") {
+                timeout(time: 1, unit: 'MINUTES') {
+                  def containerSha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                  if (containerSha != expected) error('SOURCE_CONFIG: container HEAD mismatch')
+                  sh 'test "$(id -u)" != 0 && bun --version'
+                }
+                sh '''#!/bin/sh
+set -eu
+env -i PATH="$PATH" sh scripts/ci/test-only-server.sh
+'''
+              }
+              echo "TEST_ONLY PASS exact source ${expected}; no application runtime or publication executed"
+            } finally {
+              deleteDir()
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
